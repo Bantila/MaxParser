@@ -13,7 +13,7 @@ import sys
 
 import httpx
 from dotenv import load_dotenv
-from pymax import Client, File, Message, Photo
+from pymax import Client, ConsolePasswordProvider, File, Message, Photo
 from pymax.types.domain.attachments import (
     AudioAttachment,
     FileAttachment,
@@ -49,6 +49,7 @@ def format_to_max(sender: str, text: str, is_owner: bool) -> str:
 load_dotenv()
 
 MAX_PHONE = os.getenv("MAX_PHONE", "")
+MAX_PASSWORD = os.getenv("MAX_PASSWORD", "")
 MAX_CHAT_ID = int(os.getenv("MAX_CHAT_ID") or 0)
 TG_TOKEN = os.getenv("TG_TOKEN", "")
 TG_TARGETS = parse_ids(os.getenv("TG_TARGETS", ""))
@@ -57,7 +58,19 @@ READ_ONLY = os.getenv("READ_ONLY", "true").strip().lower() != "false"
 
 TG_API = f"https://api.telegram.org/bot{TG_TOKEN}"
 
-client = Client(phone=MAX_PHONE, work_dir="cache", session_name="max.db")
+class EnvPasswordProvider:
+    """Пароль 2FA из .env — в контейнере спросить его в консоли не у кого."""
+
+    async def get_password(self, hint: str | None = None) -> str:
+        return MAX_PASSWORD
+
+
+client = Client(
+    phone=MAX_PHONE,
+    work_dir="cache",
+    session_name="max.db",
+    password_provider=EnvPasswordProvider() if MAX_PASSWORD else ConsolePasswordProvider(),
+)
 
 
 def user_name(user) -> str:
