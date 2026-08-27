@@ -11,14 +11,14 @@
 
 ```bash
 python -m venv .venv
-.venv\Scripts\pip install maxapi-python httpx python-dotenv
+.venv\Scripts\pip install -r requirements.txt
 copy .env.example .env
 ```
 
 Заполните `.env`, затем узнайте ID школьного чата и впишите его в `MAX_CHAT_ID`:
 
 ```bash
-.venv\Scripts\python bridge.py chats
+.venv\Scripts\python app\bridge.py chats
 ```
 
 При первом запуске Max пришлёт SMS-код. Дальше сессия хранится в `cache/max.db`
@@ -27,14 +27,28 @@ copy .env.example .env
 ## Запуск
 
 ```bash
-.venv\Scripts\python bridge.py
+.venv\Scripts\python app\bridge.py
 ```
+
+Запускать из корня проекта: путь к `cache/` берётся от текущей директории,
+и так он совпадает с тем, что смонтирован в контейнер.
 
 Проверка логики без сети:
 
 ```bash
-.venv\Scripts\python test_bridge.py
+.venv\Scripts\python app\test_bridge.py
 ```
+
+## Docker
+
+```bash
+docker compose build
+docker compose run --rm max-backend    # первый раз, спросит код из SMS
+docker compose up -d
+```
+
+Первый запуск обязательно через `run` — в фоне ввести код из SMS некуда.
+Сессия остаётся в `./cache`, она смонтирована в контейнер.
 
 ## Как это устроено
 
@@ -45,7 +59,7 @@ Max (школьный чат) ──on_message──► Telegram: TG_TARGETS
 Telegram getUpdates ──TG_TRUSTED──► Max: send_message в MAX_CHAT_ID
 ```
 
-Всё в одном файле `bridge.py`.
+Всё в одном файле `app/bridge.py`.
 
 ## О чём стоит помнить
 
