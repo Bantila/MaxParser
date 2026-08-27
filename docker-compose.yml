@@ -1,11 +1,8 @@
 services:
   max-backend:
-    build: 
-      context: .
-      dockerfile: Dockerfile
+    build: .
     restart: unless-stopped
     env_file:
       - .env
     volumes:
-        - ./cache:/app/cache
-
+      - ./cache:/app/cache
