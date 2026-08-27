@@ -1,0 +1,264 @@
+"""Мост Max <-> Telegram.
+
+Читает школьный чат в Max и пересылает всё в Telegram (вам и в группу класса).
+Обратно: доверенные люди пишут боту в Telegram, текст уходит в чат Max.
+
+    python bridge.py chats   - показать список чатов Max и их ID
+    python bridge.py         - запустить мост
+"""
+
+import asyncio
+import os
+import sys
+
+import httpx
+from dotenv import load_dotenv
+from pymax import Client, File, Message, Photo
+from pymax.types.domain.attachments import (
+    AudioAttachment,
+    FileAttachment,
+    PhotoAttachment,
+    VideoAttachment,
+)
+
+
+def parse_ids(raw: str) -> list[int]:
+    """'123, -456  789' -> [123, -456, 789]. Мусор молча пропускаем."""
+    out = []
+    for part in (raw or "").replace(",", " ").split():
+        try:
+            out.append(int(part))
+        except ValueError:
+            pass
+    return out
+
+
+def format_from_max(sender: str, text: str | None) -> str:
+    return f"<b>{escape(sender)}</b>\n{escape(text or '')}".strip()
+
+
+def escape(s: str) -> str:
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def format_to_max(sender: str, text: str, is_owner: bool) -> str:
+    """Чужие сообщения подписываем: они уйдут в Max с вашего аккаунта."""
+    return text if is_owner else f"{sender}: {text}"
+
+
+load_dotenv()
+
+MAX_PHONE = os.getenv("MAX_PHONE", "")
+MAX_CHAT_ID = int(os.getenv("MAX_CHAT_ID") or 0)
+TG_TOKEN = os.getenv("TG_TOKEN", "")
+TG_TARGETS = parse_ids(os.getenv("TG_TARGETS", ""))
+TG_TRUSTED = parse_ids(os.getenv("TG_TRUSTED", ""))
+READ_ONLY = os.getenv("READ_ONLY", "true").strip().lower() != "false"
+
+TG_API = f"https://api.telegram.org/bot{TG_TOKEN}"
+
+client = Client(phone=MAX_PHONE, work_dir="cache", session_name="max.db")
+
+
+def user_name(user) -> str:
+    """У User.names неудобная форма и она меняется — берём что найдём."""
+    for n in getattr(user, "names", None) or []:
+        for attr in ("name", "first_name", "display_name"):
+            value = n.get(attr) if isinstance(n, dict) else getattr(n, attr, None)
+            if value:
+                return str(value)
+        if isinstance(n, str) and n:
+            return n
+    return f"id{getattr(user, 'id', '?')}"
+
+
+async def sender_name(sender_id: int | None) -> str:
+    if not sender_id:
+        return "Max"
+    try:
+        return user_name(await client.get_user(sender_id))
+    except Exception:
+        return f"id{sender_id}"
+
+
+# --- Telegram --------------------------------------------------------------
+
+
+async def tg(http: httpx.AsyncClient, method: str, **data):
+    r = await http.post(f"{TG_API}/{method}", data=data, timeout=70)
+    return r.json()
+
+
+async def tg_upload(http: httpx.AsyncClient, chat_id: int, name: str, blob: bytes):
+    await http.post(
+        f"{TG_API}/sendDocument",
+        data={"chat_id": chat_id},
+        files={"document": (name, blob)},
+        timeout=120,
+    )
+
+
+async def tg_file_url(http: httpx.AsyncClient, file_id: str) -> str | None:
+    info = await tg(http, "getFile", file_id=file_id)
+    path = info.get("result", {}).get("file_path")
+    return f"https://api.telegram.org/file/bot{TG_TOKEN}/{path}" if path else None
+
+
+# --- Max -> Telegram -------------------------------------------------------
+
+
+async def resolve_attach(message: Message, att) -> tuple[str, str] | None:
+    """-> (url, имя файла). Для файлов и видео ссылку надо запросить отдельно."""
+    if isinstance(att, PhotoAttachment):
+        return att.base_url, f"photo_{att.photo_id}.jpg"
+    if isinstance(att, FileAttachment):
+        req = await client.get_file_by_id(message.chat_id, message.id, att.file_id)
+        return (req.url, att.name or f"file_{att.file_id}") if req else None
+    if isinstance(att, VideoAttachment):
+        req = await client.get_video_by_id(message.chat_id, message.id, att.video_id)
+        return (req.url, f"video_{att.video_id}.mp4") if req else None
+    if isinstance(att, AudioAttachment) and att.url:
+        return att.url, f"audio_{att.audio_id}.ogg"
+    return None
+
+
+@client.on_message()
+async def from_max(message: Message, client: Client) -> None:
+    if MAX_CHAT_ID and message.chat_id != MAX_CHAT_ID:
+        return
+    me = getattr(client.me, "id", None)
+    if me and message.sender == me:
+        return  # не гоняем по кругу то, что сами же отправили
+
+    name = await sender_name(message.sender)
+    async with httpx.AsyncClient() as http:
+        for chat_id in TG_TARGETS:
+            if message.text:
+                await tg(
+                    http,
+                    "sendMessage",
+                    chat_id=chat_id,
+                    text=format_from_max(name, message.text),
+                    parse_mode="HTML",
+                )
+
+        for att in message.attaches or []:
+            try:
+                found = await resolve_attach(message, att)
+                if not found:
+                    continue
+                url, filename = found
+                blob = (await http.get(url, timeout=120)).content
+            except Exception as e:
+                print(f"[max->tg] вложение не забрать: {e}", flush=True)
+                continue
+            for chat_id in TG_TARGETS:
+                try:
+                    await tg_upload(http, chat_id, filename, blob)
+                except Exception as e:
+                    print(f"[max->tg] не отправить {filename}: {e}", flush=True)
+
+
+# --- Telegram -> Max -------------------------------------------------------
+
+
+async def handle_tg_message(http: httpx.AsyncClient, msg: dict) -> None:
+    chat_id = msg["chat"]["id"]
+    user = msg.get("from", {})
+    uid = user.get("id")
+
+    if uid not in TG_TRUSTED:
+        await tg(http, "sendMessage", chat_id=chat_id, text="Вам сюда писать нельзя.")
+        return
+    if READ_ONLY:
+        await tg(
+            http,
+            "sendMessage",
+            chat_id=chat_id,
+            text="Мост работает только на чтение (READ_ONLY=true).",
+        )
+        return
+    if not MAX_CHAT_ID:
+        await tg(http, "sendMessage", chat_id=chat_id, text="MAX_CHAT_ID не задан.")
+        return
+
+    name = user.get("first_name") or str(uid)
+    is_owner = bool(TG_TRUSTED) and uid == TG_TRUSTED[0]
+    text = msg.get("text") or msg.get("caption") or ""
+
+    attachments = []
+    doc = msg.get("document")
+    photos = msg.get("photo")
+    if doc:
+        url = await tg_file_url(http, doc["file_id"])
+        if url:
+            attachments.append(File(url=url, name=doc.get("file_name") or "file"))
+    elif photos:
+        url = await tg_file_url(http, photos[-1]["file_id"])
+        if url:
+            attachments.append(Photo(url=url, name="photo.jpg"))
+
+    if not text and not attachments:
+        return
+
+    try:
+        await client.send_message(
+            MAX_CHAT_ID,
+            text=format_to_max(name, text, is_owner) if text else None,
+            attachments=attachments or None,
+        )
+        await tg(http, "sendMessage", chat_id=chat_id, text="Отправлено в Max.")
+    except Exception as e:
+        await tg(http, "sendMessage", chat_id=chat_id, text=f"Не отправилось: {e}")
+
+
+async def telegram_loop() -> None:
+    offset = None
+    async with httpx.AsyncClient() as http:
+        while True:
+            try:
+                updates = await tg(http, "getUpdates", offset=offset, timeout=50)
+                for upd in updates.get("result", []):
+                    offset = upd["update_id"] + 1
+                    if msg := upd.get("message"):
+                        await handle_tg_message(http, msg)
+            except Exception as e:
+                print(f"[tg] {e}", flush=True)
+                await asyncio.sleep(5)
+
+
+# --- Запуск ----------------------------------------------------------------
+
+
+@client.on_start()
+async def on_start(client: Client) -> None:
+    mode = "ТОЛЬКО ЧТЕНИЕ" if READ_ONLY else "чтение и отправка"
+    print(f"Мост запущен, режим: {mode}", flush=True)
+    if not MAX_CHAT_ID:
+        print("MAX_CHAT_ID пуст: в Telegram польются ВСЕ чаты Max.", flush=True)
+    asyncio.create_task(telegram_loop())
+
+
+async def show_chats() -> None:
+    await client.connect()
+    for chat in await client.fetch_chats():
+        print(f"{chat.id}\t{chat.type}\t{chat.title or '(без названия)'}")
+    await client.close()
+
+
+def main() -> None:
+    missing = [n for n in ("MAX_PHONE", "TG_TOKEN") if not os.getenv(n)]
+    if missing:
+        sys.exit(f"Не заданы в .env: {', '.join(missing)}")
+
+    if len(sys.argv) > 1 and sys.argv[1] == "chats":
+        asyncio.run(show_chats())
+        return
+
+    if not TG_TARGETS:
+        sys.exit("TG_TARGETS пуст — некуда пересылать.")
+    asyncio.run(client.start())
+
+
+if __name__ == "__main__":
+    main()
