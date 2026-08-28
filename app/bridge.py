@@ -211,23 +211,36 @@ def content_of(message: Message) -> tuple[Message, int, str]:
 
 
 async def resolve_attach(
-    chat_id: int, message_id: int, att
+    where: list[tuple[int, int]], att
 ) -> tuple[str, str, str] | None:
     """-> (url, имя файла, вид). Для файлов и видео ссылку надо запросить отдельно.
 
+    where - пары (чат, сообщение), где искать файл. У пересылки он может
+    лежать и в исходном чате, и в том, куда переслали, поэтому пробуем оба.
     Вид - "photo" или "file", он решает, в какую тему уйдёт вложение.
     """
     if isinstance(att, PhotoAttachment):
         return att.base_url, f"photo_{att.photo_id}.jpg", "photo"
-    if isinstance(att, FileAttachment):
-        req = await client.get_file_by_id(chat_id, message_id, att.file_id)
-        return (req.url, att.name or f"file_{att.file_id}", "file") if req else None
-    if isinstance(att, VideoAttachment):
-        req = await client.get_video_by_id(chat_id, message_id, att.video_id)
-        return (req.url, f"video_{att.video_id}.mp4", "file") if req else None
     if isinstance(att, AudioAttachment) and att.url:
         return att.url, f"audio_{att.audio_id}.ogg", "file"
-    return None
+
+    last = ""
+    for chat_id, message_id in where:
+        try:
+            if isinstance(att, FileAttachment):
+                req = await client.get_file_by_id(chat_id, message_id, att.file_id)
+                if req and req.url:
+                    return req.url, att.name or f"file_{att.file_id}", "file"
+            elif isinstance(att, VideoAttachment):
+                req = await client.get_video_by_id(chat_id, message_id, att.video_id)
+                if req and req.url:
+                    return req.url, f"video_{att.video_id}.mp4", "file"
+            else:
+                return None  # стикеры, опросы, системные события
+        except Exception as e:
+            last = f" ({e})"
+    name = getattr(att, "name", None) or type(att).__name__
+    raise RuntimeError(f"ссылка на {name} не получена{last}")
 
 
 @client.on_message()
@@ -282,9 +295,14 @@ async def deliver(message: Message) -> list[str]:
                     errors.append(f"чат {chat_id}, тема {thread}: {e}")
                     print(f"[max->tg] текст не ушёл в {chat_id}: {e}", flush=True)
 
+        outer_chat = message.chat_id or MAX_CHAT_ID
+        where = [(src_chat, src.id)]
+        if (outer_chat, message.id) not in where:
+            where.append((outer_chat, message.id))
+
         for att in attaches or []:
             try:
-                found = await resolve_attach(src_chat, src.id, att)
+                found = await resolve_attach(where, att)
                 if not found:
                     continue
                 url, filename, kind = found
