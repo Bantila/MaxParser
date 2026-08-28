@@ -6,7 +6,19 @@ os.environ.setdefault("MAX_PHONE", "+70000000000")
 os.environ.setdefault("TG_TOKEN", "test")
 
 import bridge
-from bridge import escape, format_from_max, format_to_max, parse_ids
+from bridge import escape, format_from_max, format_to_max, parse_ids, parse_load
+
+
+def test_parse_load():
+    assert parse_load("/load") == 10
+    assert parse_load("/load 30") == 30
+    assert parse_load("/load@MyBot 5") == 5  # в группе команда приходит с именем бота
+    assert parse_load("/load 999") == 50  # не заливаем группу целиком
+    assert parse_load("/load 0") == 1
+    assert parse_load("/load абв") == 10  # мусор вместо числа - берём умолчание
+    assert parse_load("привет") is None
+    assert parse_load("") is None
+    assert parse_load("/loadall") is None
 
 
 def test_routes():

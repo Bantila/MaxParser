@@ -46,6 +46,15 @@ def format_to_max(sender: str, text: str, is_owner: bool) -> str:
     return text if is_owner else f"{sender}: {text}"
 
 
+def parse_load(text: str) -> int | None:
+    """'/load 30' -> 30, '/load' -> 10, не команда -> None. Не больше 50."""
+    parts = (text or "").split()
+    if not parts or parts[0].split("@")[0] != "/load":
+        return None
+    count = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 10
+    return max(1, min(count, 50))
+
+
 def routes(kind: str) -> list[tuple[int, int | None]]:
     """Куда слать контент вида text/photo/file: пары (чат, тема).
 
@@ -244,6 +253,29 @@ async def forward_to_telegram(message: Message, client: Client) -> None:
 # --- Telegram -> Max -------------------------------------------------------
 
 
+async def handle_load(http: httpx.AsyncClient, chat_id: int, count: int) -> None:
+    """Перелить последние сообщения из чата Max — проверить, что мост доставляет."""
+    if not MAX_CHAT_ID:
+        await tg(http, "sendMessage", chat_id=chat_id, text="MAX_CHAT_ID не задан.")
+        return
+    try:
+        history = await client.fetch_history(MAX_CHAT_ID, backward=count)
+    except Exception as e:
+        await tg(http, "sendMessage", chat_id=chat_id, text=f"История не читается: {e}")
+        return
+
+    history = sorted(history, key=lambda m: m.time or 0)[-count:]
+    await tg(http, "sendMessage", chat_id=chat_id, text=f"Загружаю {len(history)} шт.")
+    sent = 0
+    for old in history:
+        try:
+            await forward_to_telegram(old, client)
+            sent += 1
+        except Exception as e:
+            print(f"[load] сообщение {old.id} не ушло: {e}", flush=True)
+    await tg(http, "sendMessage", chat_id=chat_id, text=f"Готово, обработано {sent}.")
+
+
 async def handle_tg_message(http: httpx.AsyncClient, msg: dict) -> None:
     chat_id = msg["chat"]["id"]
     user = msg.get("from", {})
@@ -252,6 +284,13 @@ async def handle_tg_message(http: httpx.AsyncClient, msg: dict) -> None:
     if uid not in TG_TRUSTED:
         await tg(http, "sendMessage", chat_id=chat_id, text="Вам сюда писать нельзя.")
         return
+
+    # /load читает Max, а не пишет в него, поэтому READ_ONLY ему не помеха.
+    count = parse_load(msg.get("text") or "")
+    if count is not None:
+        await handle_load(http, chat_id, count)
+        return
+
     if READ_ONLY:
         await tg(
             http,
