@@ -144,10 +144,18 @@ ssh-keyscan -H YOUR_SERVER >> /root/.ssh/known_hosts
 Проверьте вручную, затем поставьте юнит:
 
 ```bash
-ssh -i /root/.ssh/maxparser-tunnel root@YOUR_SERVER echo ok
+ssh -i /root/.ssh/maxparser-tunnel -o BatchMode=yes root@YOUR_SERVER echo ok
+```
 
-sed -i 's/YOUR_SERVER/адрес.вашего.сервера/' deploy/maxparser-tunnel.service
+Команда обязана вывести `ok` и ничего не спросить. Если просит пароль — ключ не
+доехал, и юнит упадёт на том же месте.
+
+Правим копию в `/etc`, а не файл в репозитории, иначе следующий `git pull`
+упрётся в конфликт:
+
+```bash
 cp deploy/maxparser-tunnel.service /etc/systemd/system/
+sed -i 's/YOUR_SERVER/адрес.вашего.сервера/' /etc/systemd/system/maxparser-tunnel.service
 systemctl daemon-reload
 systemctl enable --now maxparser-tunnel
 ```
