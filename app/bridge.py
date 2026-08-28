@@ -14,6 +14,7 @@ import sys
 import httpx
 from dotenv import load_dotenv
 from pymax import Client, ConsolePasswordProvider, File, Message, Photo
+from pymax.types.domain.message import LinkType
 from pymax.types.domain.attachments import (
     AudioAttachment,
     FileAttachment,
@@ -33,8 +34,9 @@ def parse_ids(raw: str) -> list[int]:
     return out
 
 
-def format_from_max(sender: str, text: str | None) -> str:
-    return f"<b>{escape(sender)}</b>\n{escape(text or '')}".strip()
+def format_from_max(sender: str, text: str | None, note: str = "") -> str:
+    head = escape(sender) + (f" ({escape(note)})" if note else "")
+    return f"<b>{head}</b>\n{escape(text or '')}".strip()
 
 
 def escape(s: str) -> str:
@@ -192,7 +194,25 @@ async def tg_download(http: httpx.AsyncClient, file_id: str) -> bytes | None:
 # --- Max -> Telegram -------------------------------------------------------
 
 
-async def resolve_attach(message: Message, att) -> tuple[str, str, str] | None:
+def content_of(message: Message) -> tuple[Message, int, str]:
+    """Где на самом деле лежит содержимое: (сообщение, чат источника, пометка).
+
+    У пересланного сообщения текст и вложения хранятся не в нём самом, а во
+    вложенном link.message, и файлы надо запрашивать из исходного чата.
+    Ответ (REPLY) так не работает: там link.message - это цитата, а
+    содержимое лежит в самом сообщении.
+    """
+    link = message.link
+    if link is not None and getattr(link, "type", None) == LinkType.FORWARD:
+        src = link.message
+        note = f"переслано из {link.chat_name}" if link.chat_name else "переслано"
+        return src, link.chat_id, note
+    return message, message.chat_id or MAX_CHAT_ID, ""
+
+
+async def resolve_attach(
+    chat_id: int, message_id: int, att
+) -> tuple[str, str, str] | None:
     """-> (url, имя файла, вид). Для файлов и видео ссылку надо запросить отдельно.
 
     Вид - "photo" или "file", он решает, в какую тему уйдёт вложение.
@@ -200,10 +220,10 @@ async def resolve_attach(message: Message, att) -> tuple[str, str, str] | None:
     if isinstance(att, PhotoAttachment):
         return att.base_url, f"photo_{att.photo_id}.jpg", "photo"
     if isinstance(att, FileAttachment):
-        req = await client.get_file_by_id(message.chat_id, message.id, att.file_id)
+        req = await client.get_file_by_id(chat_id, message_id, att.file_id)
         return (req.url, att.name or f"file_{att.file_id}", "file") if req else None
     if isinstance(att, VideoAttachment):
-        req = await client.get_video_by_id(message.chat_id, message.id, att.video_id)
+        req = await client.get_video_by_id(chat_id, message_id, att.video_id)
         return (req.url, f"video_{att.video_id}.mp4", "file") if req else None
     if isinstance(att, AudioAttachment) and att.url:
         return att.url, f"audio_{att.audio_id}.ogg", "file"
@@ -239,11 +259,15 @@ async def deliver(message: Message) -> list[str]:
     Возвращает список ошибок доставки, чтобы /load мог их показать.
     """
     errors: list[str] = []
-    name = await sender_name(message.sender)
+    src, src_chat, note = content_of(message)
+    name = await sender_name(src.sender or message.sender)
+    body = src.text or message.text
+    attaches = src.attaches or message.attaches
+
     # Telegram — через прокси, вложения из Max — напрямую: Max ждёт российский адрес.
     async with tg_http() as http, httpx.AsyncClient() as max_http:
-        if message.text:
-            text = format_from_max(name, message.text)
+        if body:
+            text = format_from_max(name, body, note)
             for chat_id, thread in routes("text"):
                 try:
                     await tg(
@@ -258,9 +282,9 @@ async def deliver(message: Message) -> list[str]:
                     errors.append(f"чат {chat_id}, тема {thread}: {e}")
                     print(f"[max->tg] текст не ушёл в {chat_id}: {e}", flush=True)
 
-        for att in message.attaches or []:
+        for att in attaches or []:
             try:
-                found = await resolve_attach(message, att)
+                found = await resolve_attach(src_chat, src.id, att)
                 if not found:
                     continue
                 url, filename, kind = found
@@ -338,7 +362,9 @@ async def handle_load(http: httpx.AsyncClient, chat_id: int, count: int) -> None
     sent = failed = empty = 0
     last_error = ""
     for old in history:
-        if not (old.text or old.attaches):
+        # У пересылки содержимое лежит в link, а своих text и attaches нет.
+        src, _, _ = content_of(old)
+        if not (src.text or src.attaches or old.text or old.attaches):
             empty += 1  # служебные записи Max: вступил в чат, создана тема
             continue
         if not old.chat_id:  # в истории поле бывает пустым

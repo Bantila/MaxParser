@@ -69,6 +69,11 @@ def test_format_from_max():
     assert format_from_max("Мария", None) == "<b>Мария</b>"
     # имя и текст не должны ломать HTML-разметку Telegram
     assert "<script>" not in format_from_max("<script>", "<script>")
+    # пометка о пересылке и экранирование в ней
+    assert format_from_max("Мария", "текст", "переслано") == (
+        "<b>Мария (переслано)</b>\nтекст"
+    )
+    assert "<b>x</b>" not in format_from_max("Мария", "т", "<b>x</b>")
 
 
 def test_format_to_max():
