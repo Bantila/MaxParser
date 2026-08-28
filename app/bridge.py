@@ -46,6 +46,25 @@ def format_to_max(sender: str, text: str, is_owner: bool) -> str:
     return text if is_owner else f"{sender}: {text}"
 
 
+def routes(kind: str) -> list[tuple[int, int | None]]:
+    """Куда слать контент вида text/photo/file: пары (чат, тема).
+
+    Тема None - обычный чат без тем. В тему "все" уходит всё подряд,
+    в том числе то, что уже ушло в свою профильную тему.
+    """
+    out: list[tuple[int, int | None]] = [(chat, None) for chat in TG_TARGETS]
+    if not TG_GROUP:
+        return out
+    if not TG_TOPICS:  # тем в группе нет - всё одним потоком
+        if (TG_GROUP, None) not in out:
+            out.append((TG_GROUP, None))
+        return out
+    for topic in (TOPICS.get(kind), TOPICS.get("all")):
+        if topic and (TG_GROUP, topic) not in out:
+            out.append((TG_GROUP, topic))
+    return out
+
+
 load_dotenv()
 
 MAX_PHONE = os.getenv("MAX_PHONE", "")
@@ -56,6 +75,17 @@ TG_PROXY = os.getenv("TG_PROXY", "")
 TG_TARGETS = parse_ids(os.getenv("TG_TARGETS", ""))
 TG_TRUSTED = parse_ids(os.getenv("TG_TRUSTED", ""))
 READ_ONLY = os.getenv("READ_ONLY", "true").strip().lower() != "false"
+
+# Группа и номера тем. Ноль в номере темы означает "в эту тему не слать".
+# TG_TOPICS=1 - раскладывать по темам, 0 - слать в группу одним потоком.
+TG_GROUP = int(os.getenv("TG_GROUP") or 0)
+TG_TOPICS = (os.getenv("TG_TOPICS") or "0").strip() == "1"
+TOPICS = {
+    "text": int(os.getenv("TG_TOPIC_TEXT") or 0),
+    "photo": int(os.getenv("TG_TOPIC_PHOTO") or 0),
+    "file": int(os.getenv("TG_TOPIC_FILE") or 0),
+    "all": int(os.getenv("TG_TOPIC_ALL") or 0),
+}
 
 TG_API = f"https://api.telegram.org/bot{TG_TOKEN}"
 
@@ -104,15 +134,26 @@ def tg_http() -> httpx.AsyncClient:
     return httpx.AsyncClient(proxy=TG_PROXY or None)
 
 
-async def tg(http: httpx.AsyncClient, method: str, **data):
+async def tg(http: httpx.AsyncClient, method: str, *, thread: int | None = None, **data):
+    if thread:
+        data["message_thread_id"] = thread
     r = await http.post(f"{TG_API}/{method}", data=data, timeout=70)
     return r.json()
 
 
-async def tg_upload(http: httpx.AsyncClient, chat_id: int, name: str, blob: bytes):
+async def tg_upload(
+    http: httpx.AsyncClient,
+    chat_id: int,
+    name: str,
+    blob: bytes,
+    thread: int | None = None,
+):
+    data: dict[str, object] = {"chat_id": chat_id}
+    if thread:
+        data["message_thread_id"] = thread
     await http.post(
         f"{TG_API}/sendDocument",
-        data={"chat_id": chat_id},
+        data=data,
         files={"document": (name, blob)},
         timeout=120,
     )
@@ -130,18 +171,21 @@ async def tg_download(http: httpx.AsyncClient, file_id: str) -> bytes | None:
 # --- Max -> Telegram -------------------------------------------------------
 
 
-async def resolve_attach(message: Message, att) -> tuple[str, str] | None:
-    """-> (url, имя файла). Для файлов и видео ссылку надо запросить отдельно."""
+async def resolve_attach(message: Message, att) -> tuple[str, str, str] | None:
+    """-> (url, имя файла, вид). Для файлов и видео ссылку надо запросить отдельно.
+
+    Вид - "photo" или "file", он решает, в какую тему уйдёт вложение.
+    """
     if isinstance(att, PhotoAttachment):
-        return att.base_url, f"photo_{att.photo_id}.jpg"
+        return att.base_url, f"photo_{att.photo_id}.jpg", "photo"
     if isinstance(att, FileAttachment):
         req = await client.get_file_by_id(message.chat_id, message.id, att.file_id)
-        return (req.url, att.name or f"file_{att.file_id}") if req else None
+        return (req.url, att.name or f"file_{att.file_id}", "file") if req else None
     if isinstance(att, VideoAttachment):
         req = await client.get_video_by_id(message.chat_id, message.id, att.video_id)
-        return (req.url, f"video_{att.video_id}.mp4") if req else None
+        return (req.url, f"video_{att.video_id}.mp4", "file") if req else None
     if isinstance(att, AudioAttachment) and att.url:
-        return att.url, f"audio_{att.audio_id}.ogg"
+        return att.url, f"audio_{att.audio_id}.ogg", "file"
     return None
 
 
@@ -165,29 +209,34 @@ async def forward_to_telegram(message: Message, client: Client) -> None:
     name = await sender_name(message.sender)
     # Telegram — через прокси, вложения из Max — напрямую: Max ждёт российский адрес.
     async with tg_http() as http, httpx.AsyncClient() as max_http:
-        for chat_id in TG_TARGETS:
-            if message.text:
-                await tg(
-                    http,
-                    "sendMessage",
-                    chat_id=chat_id,
-                    text=format_from_max(name, message.text),
-                    parse_mode="HTML",
-                )
+        if message.text:
+            text = format_from_max(name, message.text)
+            for chat_id, thread in routes("text"):
+                try:
+                    await tg(
+                        http,
+                        "sendMessage",
+                        thread=thread,
+                        chat_id=chat_id,
+                        text=text,
+                        parse_mode="HTML",
+                    )
+                except Exception as e:
+                    print(f"[max->tg] текст не ушёл в {chat_id}: {e}", flush=True)
 
         for att in message.attaches or []:
             try:
                 found = await resolve_attach(message, att)
                 if not found:
                     continue
-                url, filename = found
+                url, filename, kind = found
                 blob = (await max_http.get(url, timeout=120)).content
             except Exception as e:
                 print(f"[max->tg] вложение не забрать: {e}", flush=True)
                 continue
-            for chat_id in TG_TARGETS:
+            for chat_id, thread in routes(kind):
                 try:
-                    await tg_upload(http, chat_id, filename, blob)
+                    await tg_upload(http, chat_id, filename, blob, thread)
                 except Exception as e:
                     print(f"[max->tg] не отправить {filename}: {e}", flush=True)
 

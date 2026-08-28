@@ -5,7 +5,33 @@ import os
 os.environ.setdefault("MAX_PHONE", "+70000000000")
 os.environ.setdefault("TG_TOKEN", "test")
 
+import bridge
 from bridge import escape, format_from_max, format_to_max, parse_ids
+
+
+def test_routes():
+    bridge.TG_TARGETS = [111]
+    bridge.TG_GROUP = -1001
+    bridge.TG_TOPICS = True
+    bridge.TOPICS = {"text": 2, "photo": 3, "file": 4, "all": 5}
+    # личка без темы, потом профильная тема, потом "все"
+    assert bridge.routes("photo") == [(111, None), (-1001, 3), (-1001, 5)]
+    assert bridge.routes("text") == [(111, None), (-1001, 2), (-1001, 5)]
+
+    # незаданная тема пропускается, дубля с "все" не будет
+    bridge.TOPICS = {"text": 0, "photo": 5, "file": 0, "all": 5}
+    assert bridge.routes("file") == [(111, None), (-1001, 5)]
+    assert bridge.routes("photo") == [(111, None), (-1001, 5)]
+
+    # тем в группе нет - всё одним потоком, номера тем игнорируются
+    bridge.TG_TOPICS = False
+    bridge.TOPICS = {"text": 2, "photo": 3, "file": 4, "all": 5}
+    assert bridge.routes("photo") == [(111, None), (-1001, None)]
+    assert bridge.routes("text") == [(111, None), (-1001, None)]
+
+    # без группы остаётся только обычная рассылка
+    bridge.TG_GROUP = 0
+    assert bridge.routes("text") == [(111, None)]
 
 
 def test_parse_ids():
