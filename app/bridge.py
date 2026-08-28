@@ -52,6 +52,7 @@ MAX_PHONE = os.getenv("MAX_PHONE", "")
 MAX_PASSWORD = os.getenv("MAX_PASSWORD", "")
 MAX_CHAT_ID = int(os.getenv("MAX_CHAT_ID") or 0)
 TG_TOKEN = os.getenv("TG_TOKEN", "")
+TG_PROXY = os.getenv("TG_PROXY", "")
 TG_TARGETS = parse_ids(os.getenv("TG_TARGETS", ""))
 TG_TRUSTED = parse_ids(os.getenv("TG_TRUSTED", ""))
 READ_ONLY = os.getenv("READ_ONLY", "true").strip().lower() != "false"
@@ -97,6 +98,12 @@ async def sender_name(sender_id: int | None) -> str:
 # --- Telegram --------------------------------------------------------------
 
 
+def tg_http() -> httpx.AsyncClient:
+    """Клиент для Telegram. С российских адресов api.telegram.org обычно
+    недоступен — тогда в TG_PROXY нужен прокси (socks5:// или http://)."""
+    return httpx.AsyncClient(proxy=TG_PROXY or None)
+
+
 async def tg(http: httpx.AsyncClient, method: str, **data):
     r = await http.post(f"{TG_API}/{method}", data=data, timeout=70)
     return r.json()
@@ -111,10 +118,13 @@ async def tg_upload(http: httpx.AsyncClient, chat_id: int, name: str, blob: byte
     )
 
 
-async def tg_file_url(http: httpx.AsyncClient, file_id: str) -> str | None:
+async def tg_download(http: httpx.AsyncClient, file_id: str) -> bytes | None:
     info = await tg(http, "getFile", file_id=file_id)
     path = info.get("result", {}).get("file_path")
-    return f"https://api.telegram.org/file/bot{TG_TOKEN}/{path}" if path else None
+    if not path:
+        return None
+    url = f"https://api.telegram.org/file/bot{TG_TOKEN}/{path}"
+    return (await http.get(url, timeout=120)).content
 
 
 # --- Max -> Telegram -------------------------------------------------------
@@ -137,6 +147,15 @@ async def resolve_attach(message: Message, att) -> tuple[str, str] | None:
 
 @client.on_message()
 async def from_max(message: Message, client: Client) -> None:
+    # Исключение отсюда pymax превращает в RuntimeError и рвёт соединение
+    # с Max, поэтому глушим всё на границе обработчика.
+    try:
+        await forward_to_telegram(message, client)
+    except Exception as e:
+        print(f"[max->tg] сбой: {e!r}", flush=True)
+
+
+async def forward_to_telegram(message: Message, client: Client) -> None:
     if MAX_CHAT_ID and message.chat_id != MAX_CHAT_ID:
         return
     me = getattr(client.me, "id", None)
@@ -144,7 +163,8 @@ async def from_max(message: Message, client: Client) -> None:
         return  # не гоняем по кругу то, что сами же отправили
 
     name = await sender_name(message.sender)
-    async with httpx.AsyncClient() as http:
+    # Telegram — через прокси, вложения из Max — напрямую: Max ждёт российский адрес.
+    async with tg_http() as http, httpx.AsyncClient() as max_http:
         for chat_id in TG_TARGETS:
             if message.text:
                 await tg(
@@ -161,7 +181,7 @@ async def from_max(message: Message, client: Client) -> None:
                 if not found:
                     continue
                 url, filename = found
-                blob = (await http.get(url, timeout=120)).content
+                blob = (await max_http.get(url, timeout=120)).content
             except Exception as e:
                 print(f"[max->tg] вложение не забрать: {e}", flush=True)
                 continue
@@ -199,17 +219,18 @@ async def handle_tg_message(http: httpx.AsyncClient, msg: dict) -> None:
     is_owner = bool(TG_TRUSTED) and uid == TG_TRUSTED[0]
     text = msg.get("text") or msg.get("caption") or ""
 
+    # Файл качаем сами: по url его тянул бы pymax напрямую, мимо TG_PROXY.
     attachments = []
     doc = msg.get("document")
     photos = msg.get("photo")
     if doc:
-        url = await tg_file_url(http, doc["file_id"])
-        if url:
-            attachments.append(File(url=url, name=doc.get("file_name") or "file"))
+        blob = await tg_download(http, doc["file_id"])
+        if blob:
+            attachments.append(File(raw=blob, name=doc.get("file_name") or "file"))
     elif photos:
-        url = await tg_file_url(http, photos[-1]["file_id"])
-        if url:
-            attachments.append(Photo(url=url, name="photo.jpg"))
+        blob = await tg_download(http, photos[-1]["file_id"])
+        if blob:
+            attachments.append(Photo(raw=blob, name="photo.jpg"))
 
     if not text and not attachments:
         return
@@ -227,7 +248,7 @@ async def handle_tg_message(http: httpx.AsyncClient, msg: dict) -> None:
 
 async def telegram_loop() -> None:
     offset = None
-    async with httpx.AsyncClient() as http:
+    async with tg_http() as http:
         while True:
             try:
                 updates = await tg(http, "getUpdates", offset=offset, timeout=50)
