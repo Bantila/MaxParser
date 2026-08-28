@@ -209,12 +209,21 @@ async def from_max(message: Message, client: Client) -> None:
 
 
 async def forward_to_telegram(message: Message, client: Client) -> None:
+    """Живой поток: отсеиваем чужие чаты и собственное эхо, потом доставляем."""
     if MAX_CHAT_ID and message.chat_id != MAX_CHAT_ID:
         return
     me = getattr(client.me, "id", None)
     if me and message.sender == me:
         return  # не гоняем по кругу то, что сами же отправили
+    await deliver(message)
 
+
+async def deliver(message: Message) -> None:
+    """Собственно отправка в Telegram, без фильтров живого потока.
+
+    /load зовёт её напрямую: в истории chat_id часто пуст, а эха тут быть
+    не может, так что фильтры отсеяли бы всё подряд.
+    """
     name = await sender_name(message.sender)
     # Telegram — через прокси, вложения из Max — напрямую: Max ждёт российский адрес.
     async with tg_http() as http, httpx.AsyncClient() as max_http:
@@ -283,15 +292,31 @@ async def handle_load(http: httpx.AsyncClient, chat_id: int, count: int) -> None
         return
 
     history = sorted(history, key=lambda m: m.time or 0)[-count:]
-    await tg(http, "sendMessage", chat_id=chat_id, text=f"Загружаю {len(history)} шт.")
-    sent = 0
+    targets = len(routes("text"))
+    await tg(
+        http,
+        "sendMessage",
+        chat_id=chat_id,
+        text=f"Загружаю {len(history)} шт., адресатов: {targets}.",
+    )
+
+    sent = failed = 0
     for old in history:
+        if not old.chat_id:  # в истории поле бывает пустым
+            old.chat_id = MAX_CHAT_ID
         try:
-            await forward_to_telegram(old, client)
+            await deliver(old)
             sent += 1
         except Exception as e:
+            failed += 1
             print(f"[load] сообщение {old.id} не ушло: {e}", flush=True)
-    await tg(http, "sendMessage", chat_id=chat_id, text=f"Готово, обработано {sent}.")
+
+    report = f"Готово, отправлено {sent} из {len(history)}."
+    if failed:
+        report += f" Ошибок: {failed}, подробности в логах контейнера."
+    if not targets:
+        report += " Адресатов ноль: проверьте TG_TARGETS и TG_GROUP."
+    await tg(http, "sendMessage", chat_id=chat_id, text=report)
 
 
 async def handle_tg_message(http: httpx.AsyncClient, msg: dict) -> None:
