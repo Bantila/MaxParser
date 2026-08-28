@@ -118,6 +118,60 @@ docker compose logs -f
 
 Мост переживает перезагрузку сервера — за это отвечает `restart: unless-stopped`.
 
+### Прокси для Telegram
+
+С российского адреса `api.telegram.org`, как правило, недоступен — в логах это
+`httpx.ConnectTimeout`. Проверить:
+
+```bash
+curl -sI --max-time 10 https://api.telegram.org || echo "нужен туннель"
+```
+
+Прокси делается SSH-туннелем на любой зарубежный сервер, куда у вас есть доступ.
+Ничего устанавливать не нужно: `ssh -D` умеет это сам.
+
+Заведите отдельный ключ, чтобы не трогать существующие:
+
+```bash
+ssh-keygen -t ed25519 -f /root/.ssh/maxparser-tunnel -N ""
+ssh-copy-id -i /root/.ssh/maxparser-tunnel.pub root@YOUR_SERVER
+ssh-keyscan -H YOUR_SERVER >> /root/.ssh/known_hosts
+```
+
+Последняя строка обязательна: юнит запускается с `BatchMode=yes` и без неё
+упадёт на подтверждении ключа хоста.
+
+Проверьте вручную, затем поставьте юнит:
+
+```bash
+ssh -i /root/.ssh/maxparser-tunnel root@YOUR_SERVER echo ok
+
+sed -i 's/YOUR_SERVER/адрес.вашего.сервера/' deploy/maxparser-tunnel.service
+cp deploy/maxparser-tunnel.service /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now maxparser-tunnel
+```
+
+Убедитесь, что туннель поднялся и работает:
+
+```bash
+systemctl status maxparser-tunnel
+ss -ltnp | grep 21080
+curl --socks5 127.0.0.1:21080 -sI https://api.telegram.org | head -1
+```
+
+Последняя команда должна вернуть `HTTP/1.1 200 OK`. Теперь в `.env`:
+
+```
+TG_PROXY=socks5://127.0.0.1:21080
+```
+
+**Что сделано, чтобы не задеть соседей по серверу.** Порт 21080 вместо типичного
+1080 и только на `127.0.0.1` — снаружи он не виден, анонимный прокси в интернет
+не открывается. Ключ отдельный, существующие не затрагиваются. Имя юнита
+с префиксом проекта. Контейнер работает в `network_mode: host`, но портов не
+слушает, поэтому занять чужой не может, и ограничен 256 МБ памяти.
+
 ### Обновление
 
 ```bash

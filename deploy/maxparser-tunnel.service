@@ -1,0 +1,32 @@
+; SOCKS5-туннель для Telegram: api.telegram.org недоступен с российского
+; адреса, поэтому Telegram ходит через зарубежный сервер по SSH.
+; Max при этом остаётся на прямом соединении, ему нужен российский IP.
+;
+; Сделано так, чтобы ничего не задеть на общем сервере:
+;   - порт 21080 вместо типичного 1080, и только на 127.0.0.1;
+;   - отдельный ключ, существующие ~/.ssh/* не трогаются;
+;   - имя юнита с префиксом проекта.
+;
+; Подставьте свой адрес вместо YOUR_SERVER.
+; Установка описана в README, раздел "Прокси для Telegram".
+
+[Unit]
+Description=SOCKS5 tunnel for Telegram (MaxParser)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/ssh -N -D 127.0.0.1:21080 \
+    -o BatchMode=yes \
+    -o ExitOnForwardFailure=yes \
+    -o ServerAliveInterval=30 \
+    -o ServerAliveCountMax=3 \
+    -o StrictHostKeyChecking=yes \
+    -i /root/.ssh/maxparser-tunnel \
+    root@YOUR_SERVER
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
