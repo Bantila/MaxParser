@@ -76,6 +76,20 @@ def test_format_from_max():
     assert "<b>x</b>" not in format_from_max("Мария", "т", "<b>x</b>")
 
 
+def test_describe_attach():
+    class Att:
+        name = "Расписание.doc"
+        size = 41500
+
+    out = bridge.describe_attach("Мария", Att())
+    assert "Расписание.doc" in out and "41 КБ" in out
+
+    class Bare:
+        pass
+
+    assert "файл" in bridge.describe_attach("Мария", Bare())
+
+
 def test_format_to_max():
     assert format_to_max("Костя", "буду", True) == "буду"
     assert format_to_max("Петя", "буду", False) == "Петя: буду"

@@ -194,6 +194,18 @@ async def tg_download(http: httpx.AsyncClient, file_id: str) -> bytes | None:
 # --- Max -> Telegram -------------------------------------------------------
 
 
+def describe_attach(sender: str, att) -> str:
+    """Заглушка для файла, который Max отказался отдавать."""
+    name = getattr(att, "name", None) or "файл"
+    size = getattr(att, "size", None)
+    weight = f", {round(size / 1024)} КБ" if size else ""
+    return (
+        f"<b>{escape(sender)}</b>\n"
+        f"Вложение: {escape(name)}{weight}\n"
+        f"Скачать не удалось, откройте в Max."
+    )
+
+
 def content_of(message: Message) -> tuple[Message, int, str]:
     """Где на самом деле лежит содержимое: (сообщение, чат источника, пометка).
 
@@ -295,10 +307,18 @@ async def deliver(message: Message) -> list[str]:
                     errors.append(f"чат {chat_id}, тема {thread}: {e}")
                     print(f"[max->tg] текст не ушёл в {chat_id}: {e}", flush=True)
 
+        # Для пересылки неизвестно, по какой паре Max отдаст файл: сообщение
+        # и чат бывают и исходные, и те, куда переслали. Пробуем все.
         outer_chat = message.chat_id or MAX_CHAT_ID
-        where = [(src_chat, src.id)]
-        if (outer_chat, message.id) not in where:
-            where.append((outer_chat, message.id))
+        where: list[tuple[int, int]] = []
+        for pair in (
+            (src_chat, src.id),
+            (outer_chat, message.id),
+            (outer_chat, src.id),
+            (src_chat, message.id),
+        ):
+            if pair not in where:
+                where.append(pair)
 
         for att in attaches or []:
             try:
@@ -310,6 +330,19 @@ async def deliver(message: Message) -> list[str]:
             except Exception as e:
                 errors.append(f"вложение не забрать: {e}")
                 print(f"[max->tg] вложение не забрать: {e}", flush=True)
+                # Скачать не вышло - хотя бы сообщим, что файл был.
+                for chat_id, thread in routes("file"):
+                    try:
+                        await tg(
+                            http,
+                            "sendMessage",
+                            thread=thread,
+                            chat_id=chat_id,
+                            text=describe_attach(name, att),
+                            parse_mode="HTML",
+                        )
+                    except Exception:
+                        pass
                 continue
             for chat_id, thread in routes(kind):
                 try:
