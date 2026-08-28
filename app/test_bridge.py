@@ -35,6 +35,12 @@ def test_routes():
     assert bridge.routes("file") == [(111, None), (-1001, 5)]
     assert bridge.routes("photo") == [(111, None), (-1001, 5)]
 
+    # General (номер 1) уходит без message_thread_id, иначе Bot API отвечает
+    # message thread not found
+    bridge.TG_TOPICS = True
+    bridge.TOPICS = {"text": 1, "photo": 3, "file": 4, "all": 5}
+    assert bridge.routes("text") == [(111, None), (-1001, None), (-1001, 5)]
+
     # тем в группе нет - всё одним потоком, номера тем игнорируются
     bridge.TG_TOPICS = False
     bridge.TOPICS = {"text": 2, "photo": 3, "file": 4, "all": 5}

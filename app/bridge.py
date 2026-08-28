@@ -69,8 +69,13 @@ def routes(kind: str) -> list[tuple[int, int | None]]:
             out.append((TG_GROUP, None))
         return out
     for topic in (TOPICS.get(kind), TOPICS.get("all")):
-        if topic and (TG_GROUP, topic) not in out:
-            out.append((TG_GROUP, topic))
+        if not topic:
+            continue
+        # У General номер 1, но Bot API его не принимает: message thread
+        # not found. В General пишут вообще без message_thread_id.
+        thread = None if topic == 1 else topic
+        if (TG_GROUP, thread) not in out:
+            out.append((TG_GROUP, thread))
     return out
 
 
@@ -281,6 +286,22 @@ async def handle_load(http: httpx.AsyncClient, chat_id: int, count: int) -> None
     if not MAX_CHAT_ID:
         await tg(http, "sendMessage", chat_id=chat_id, text="MAX_CHAT_ID не задан.")
         return
+
+    # pymax переподключается сам, но запрос в этот момент падает с
+    # "Not connected to the server" или "Ping failed". Ждём восстановления.
+    for _ in range(6):
+        if client.is_connected:
+            break
+        await asyncio.sleep(5)
+    else:
+        await tg(
+            http,
+            "sendMessage",
+            chat_id=chat_id,
+            text="Мост переподключается к Max. Повторите через минуту.",
+        )
+        return
+
     try:
         # Сразу после старта клиент ещё не синхронизировал чаты (chats=0),
         # и история приходит пустой. Прогреваем список перед запросом.
@@ -417,6 +438,11 @@ async def telegram_loop() -> None:
 
 
 # --- Запуск ----------------------------------------------------------------
+
+
+@client.on_disconnect()
+async def on_disconnect(*args) -> None:
+    print("[max] связь потеряна, pymax переподключается", flush=True)
 
 
 @client.on_start()
