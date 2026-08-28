@@ -259,9 +259,27 @@ async def handle_load(http: httpx.AsyncClient, chat_id: int, count: int) -> None
         await tg(http, "sendMessage", chat_id=chat_id, text="MAX_CHAT_ID не задан.")
         return
     try:
+        # Сразу после старта клиент ещё не синхронизировал чаты (chats=0),
+        # и история приходит пустой. Прогреваем список перед запросом.
+        chats = await client.fetch_chats()
         history = await client.fetch_history(MAX_CHAT_ID, backward=count)
     except Exception as e:
         await tg(http, "sendMessage", chat_id=chat_id, text=f"История не читается: {e}")
+        return
+
+    if not history:
+        known = [c.id for c in chats]
+        where = "есть" if MAX_CHAT_ID in known else "НЕТ"
+        await tg(
+            http,
+            "sendMessage",
+            chat_id=chat_id,
+            text=(
+                f"История пуста. MAX_CHAT_ID={MAX_CHAT_ID}, "
+                f"в списке из {len(chats)} чатов его {where}.\n"
+                f"Доступные: {', '.join(str(i) for i in known) or 'нет'}"
+            ),
+        )
         return
 
     history = sorted(history, key=lambda m: m.time or 0)[-count:]
