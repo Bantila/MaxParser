@@ -147,7 +147,11 @@ async def tg(http: httpx.AsyncClient, method: str, *, thread: int | None = None,
     if thread:
         data["message_thread_id"] = thread
     r = await http.post(f"{TG_API}/{method}", data=data, timeout=70)
-    return r.json()
+    out = r.json()
+    # Telegram отвечает 200 даже на отказ, ошибка лежит внутри тела.
+    if not out.get("ok"):
+        raise RuntimeError(f"{method}: {out.get('description')}")
+    return out
 
 
 async def tg_upload(
@@ -160,12 +164,15 @@ async def tg_upload(
     data: dict[str, object] = {"chat_id": chat_id}
     if thread:
         data["message_thread_id"] = thread
-    await http.post(
+    r = await http.post(
         f"{TG_API}/sendDocument",
         data=data,
         files={"document": (name, blob)},
         timeout=120,
     )
+    out = r.json()
+    if not out.get("ok"):
+        raise RuntimeError(f"sendDocument: {out.get('description')}")
 
 
 async def tg_download(http: httpx.AsyncClient, file_id: str) -> bytes | None:
@@ -218,12 +225,15 @@ async def forward_to_telegram(message: Message, client: Client) -> None:
     await deliver(message)
 
 
-async def deliver(message: Message) -> None:
+async def deliver(message: Message) -> list[str]:
     """Собственно отправка в Telegram, без фильтров живого потока.
 
     /load зовёт её напрямую: в истории chat_id часто пуст, а эха тут быть
     не может, так что фильтры отсеяли бы всё подряд.
+
+    Возвращает список ошибок доставки, чтобы /load мог их показать.
     """
+    errors: list[str] = []
     name = await sender_name(message.sender)
     # Telegram — через прокси, вложения из Max — напрямую: Max ждёт российский адрес.
     async with tg_http() as http, httpx.AsyncClient() as max_http:
@@ -240,6 +250,7 @@ async def deliver(message: Message) -> None:
                         parse_mode="HTML",
                     )
                 except Exception as e:
+                    errors.append(f"чат {chat_id}, тема {thread}: {e}")
                     print(f"[max->tg] текст не ушёл в {chat_id}: {e}", flush=True)
 
         for att in message.attaches or []:
@@ -250,13 +261,16 @@ async def deliver(message: Message) -> None:
                 url, filename, kind = found
                 blob = (await max_http.get(url, timeout=120)).content
             except Exception as e:
+                errors.append(f"вложение не забрать: {e}")
                 print(f"[max->tg] вложение не забрать: {e}", flush=True)
                 continue
             for chat_id, thread in routes(kind):
                 try:
                     await tg_upload(http, chat_id, filename, blob, thread)
                 except Exception as e:
+                    errors.append(f"{filename} -> чат {chat_id}, тема {thread}: {e}")
                     print(f"[max->tg] не отправить {filename}: {e}", flush=True)
+    return errors
 
 
 # --- Telegram -> Max -------------------------------------------------------
@@ -300,20 +314,30 @@ async def handle_load(http: httpx.AsyncClient, chat_id: int, count: int) -> None
         text=f"Загружаю {len(history)} шт., адресатов: {targets}.",
     )
 
-    sent = failed = 0
+    sent = failed = empty = 0
+    last_error = ""
     for old in history:
+        if not (old.text or old.attaches):
+            empty += 1  # служебные записи Max: вступил в чат, создана тема
+            continue
         if not old.chat_id:  # в истории поле бывает пустым
             old.chat_id = MAX_CHAT_ID
         try:
-            await deliver(old)
+            errs = await deliver(old)
             sent += 1
+            if errs:
+                failed += len(errs)
+                last_error = errs[-1]
         except Exception as e:
             failed += 1
+            last_error = str(e)
             print(f"[load] сообщение {old.id} не ушло: {e}", flush=True)
 
     report = f"Готово, отправлено {sent} из {len(history)}."
+    if empty:
+        report += f" Пустых и служебных: {empty}."
     if failed:
-        report += f" Ошибок: {failed}, подробности в логах контейнера."
+        report += f" Ошибок: {failed}. Последняя: {last_error}"
     if not targets:
         report += " Адресатов ноль: проверьте TG_TARGETS и TG_GROUP."
     await tg(http, "sendMessage", chat_id=chat_id, text=report)
