@@ -133,6 +133,22 @@ def user_name(user) -> str:
     return f"id{getattr(user, 'id', '?')}"
 
 
+def id_of(obj) -> int | None:
+    """Свой ID: client.me возвращает Profile, где id лежит внутри contact."""
+    for candidate in (obj, getattr(obj, "contact", None)):
+        uid = getattr(candidate, "id", None)
+        if isinstance(uid, int):
+            return uid
+    return None
+
+
+def own_id() -> int | None:
+    try:
+        return id_of(client.me)
+    except Exception:
+        return None
+
+
 async def sender_name(sender_id: int | None) -> str:
     if not sender_id:
         return "Max"
@@ -274,13 +290,12 @@ async def from_max(message: Message, client: Client) -> None:
 
 async def forward_to_telegram(message: Message, client: Client) -> None:
     """Живой поток: отсеиваем чужие чаты и собственное эхо, потом доставляем."""
-    if MAX_CHAT_ID and message.chat_id and message.chat_id != MAX_CHAT_ID:
+    # Именно is not None: у «Избранного» chat_id равен нулю, и проверка
+    # на истинность пропускала личные чаты в общую группу.
+    if MAX_CHAT_ID and message.chat_id is not None and message.chat_id != MAX_CHAT_ID:
         print(f"[max] пропуск: чужой чат {message.chat_id}", flush=True)
         return
-    try:
-        me = getattr(client.me, "id", None)
-    except Exception:
-        me = None
+    me = own_id()
     if me and message.sender == me:
         print("[max] пропуск: собственное сообщение", flush=True)
         return

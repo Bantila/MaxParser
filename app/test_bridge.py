@@ -76,6 +76,22 @@ def test_format_from_max():
     assert "<b>x</b>" not in format_from_max("Мария", "т", "<b>x</b>")
 
 
+def test_id_of():
+    class Plain:
+        id = 42
+
+    class Contact:
+        id = 77
+
+    class Profile:  # так устроен client.me: id лежит внутри contact
+        contact = Contact()
+
+    assert bridge.id_of(Plain()) == 42
+    assert bridge.id_of(Profile()) == 77
+    assert bridge.id_of(None) is None
+    assert bridge.id_of(object()) is None
+
+
 def test_describe_attach():
     class Att:
         name = "Расписание.doc"
