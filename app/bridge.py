@@ -91,6 +91,7 @@ TG_PROXY = os.getenv("TG_PROXY", "")
 TG_TARGETS = parse_ids(os.getenv("TG_TARGETS", ""))
 TG_TRUSTED = parse_ids(os.getenv("TG_TRUSTED", ""))
 READ_ONLY = os.getenv("READ_ONLY", "true").strip().lower() != "false"
+RAW_LOG = (os.getenv("RAW_LOG") or "0").strip() == "1"
 
 # Группа и номера тем. Ноль в номере темы означает "в эту тему не слать".
 # TG_TOPICS=1 - раскладывать по темам, 0 - слать в группу одним потоком.
@@ -535,6 +536,17 @@ async def telegram_loop() -> None:
 # --- Запуск ----------------------------------------------------------------
 
 
+@client.on_raw()
+async def on_raw(frame, *args) -> None:
+    """Временная диагностика: видно, шлёт ли сервер вообще что-нибудь."""
+    if RAW_LOG:
+        print(
+            f"[raw] opcode={getattr(frame, 'opcode', None)} "
+            f"cmd={getattr(frame, 'cmd', None)} seq={getattr(frame, 'seq', None)}",
+            flush=True,
+        )
+
+
 @client.on_disconnect()
 async def on_disconnect(*args) -> None:
     print("[max] связь потеряна, pymax переподключается", flush=True)
@@ -550,6 +562,17 @@ async def on_start(client: Client) -> None:
         print(f"Синхронизировано чатов: {len(chats)}", flush=True)
     except Exception as e:
         print(f"Не удалось получить список чатов: {e}", flush=True)
+
+    # Обычный клиент Max держит статус онлайн и открывает чат; без этого
+    # сервер может не считать нас активным получателем событий.
+    try:
+        await client.set_presence(online=True)
+        if MAX_CHAT_ID:
+            await client.get_chat(MAX_CHAT_ID)
+            await client.fetch_history(MAX_CHAT_ID, backward=1)
+        print("Подписка на чат установлена", flush=True)
+    except Exception as e:
+        print(f"Не удалось подписаться на чат: {e}", flush=True)
     if not MAX_CHAT_ID:
         print("MAX_CHAT_ID пуст: в Telegram польются ВСЕ чаты Max.", flush=True)
     asyncio.create_task(telegram_loop())
