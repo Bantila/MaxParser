@@ -565,8 +565,8 @@ def main() -> None:
         asyncio.run(show_chats())
         return
 
-    if not TG_TARGETS:
-        sys.exit("TG_TARGETS пуст — некуда пересылать.")
+    if not routes("text"):
+        sys.exit("Некуда пересылать: заполните TG_TARGETS или TG_GROUP с темами.")
     asyncio.run(client.start())
 
 
