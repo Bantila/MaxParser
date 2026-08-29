@@ -260,6 +260,12 @@ async def from_max(message: Message, client: Client) -> None:
     # Исключение отсюда pymax превращает в RuntimeError и рвёт соединение
     # с Max, поэтому глушим всё на границе обработчика.
     try:
+        print(
+            f"[max] событие: чат={message.chat_id} от={message.sender} "
+            f"текст={bool(message.text)} вложений={len(message.attaches or [])} "
+            f"link={getattr(message.link, 'type', None)}",
+            flush=True,
+        )
         await forward_to_telegram(message, client)
     except Exception as e:
         print(f"[max->tg] сбой: {e!r}", flush=True)
@@ -267,12 +273,18 @@ async def from_max(message: Message, client: Client) -> None:
 
 async def forward_to_telegram(message: Message, client: Client) -> None:
     """Живой поток: отсеиваем чужие чаты и собственное эхо, потом доставляем."""
-    if MAX_CHAT_ID and message.chat_id != MAX_CHAT_ID:
+    if MAX_CHAT_ID and message.chat_id and message.chat_id != MAX_CHAT_ID:
+        print(f"[max] пропуск: чужой чат {message.chat_id}", flush=True)
         return
-    me = getattr(client.me, "id", None)
+    try:
+        me = getattr(client.me, "id", None)
+    except Exception:
+        me = None
     if me and message.sender == me:
-        return  # не гоняем по кругу то, что сами же отправили
-    await deliver(message)
+        print("[max] пропуск: собственное сообщение", flush=True)
+        return
+    errors = await deliver(message)
+    print(f"[max] доставлено, ошибок: {len(errors)}", flush=True)
 
 
 async def deliver(message: Message) -> list[str]:
@@ -526,6 +538,12 @@ async def on_disconnect(*args) -> None:
 async def on_start(client: Client) -> None:
     mode = "ТОЛЬКО ЧТЕНИЕ" if READ_ONLY else "чтение и отправка"
     print(f"Мост запущен, режим: {mode}", flush=True)
+    try:
+        # Без синхронизации чатов сервер может не слать события в них.
+        chats = await client.fetch_chats()
+        print(f"Синхронизировано чатов: {len(chats)}", flush=True)
+    except Exception as e:
+        print(f"Не удалось получить список чатов: {e}", flush=True)
     if not MAX_CHAT_ID:
         print("MAX_CHAT_ID пуст: в Telegram польются ВСЕ чаты Max.", flush=True)
     asyncio.create_task(telegram_loop())
