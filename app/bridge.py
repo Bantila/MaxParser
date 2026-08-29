@@ -566,7 +566,7 @@ async def on_start(client: Client) -> None:
     # Обычный клиент Max держит статус онлайн и открывает чат; без этого
     # сервер может не считать нас активным получателем событий.
     try:
-        await client.set_presence(online=True)
+        client.set_presence(online=True)  # синхронный, ждать его нельзя
         if MAX_CHAT_ID:
             await client.get_chat(MAX_CHAT_ID)
             await client.fetch_history(MAX_CHAT_ID, backward=1)
