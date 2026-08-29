@@ -287,14 +287,21 @@ async def forward_to_telegram(message: Message, client: Client) -> None:
     print(f"[max] доставлено, ошибок: {len(errors)}", flush=True)
 
 
-async def deliver(message: Message) -> list[str]:
+async def deliver(
+    message: Message, to: list[tuple[int, int | None]] | None = None
+) -> list[str]:
     """Собственно отправка в Telegram, без фильтров живого потока.
 
     /load зовёт её напрямую: в истории chat_id часто пуст, а эха тут быть
-    не может, так что фильтры отсеяли бы всё подряд.
+    не может, так что фильтры отсеяли бы всё подряд. Он же передаёт to,
+    чтобы выгрузка ушла в чат с ботом, а не в группу класса.
 
     Возвращает список ошибок доставки, чтобы /load мог их показать.
     """
+
+    def dest(kind: str) -> list[tuple[int, int | None]]:
+        return to if to is not None else routes(kind)
+
     errors: list[str] = []
     src, src_chat, note = content_of(message)
     name = await sender_name(src.sender or message.sender)
@@ -305,7 +312,7 @@ async def deliver(message: Message) -> list[str]:
     async with tg_http() as http, httpx.AsyncClient() as max_http:
         if body:
             text = format_from_max(name, body, note)
-            for chat_id, thread in routes("text"):
+            for chat_id, thread in dest("text"):
                 try:
                     await tg(
                         http,
@@ -343,7 +350,7 @@ async def deliver(message: Message) -> list[str]:
                 errors.append(f"вложение не забрать: {e}")
                 print(f"[max->tg] вложение не забрать: {e}", flush=True)
                 # Скачать не вышло - хотя бы сообщим, что файл был.
-                for chat_id, thread in routes("file"):
+                for chat_id, thread in dest("file"):
                     try:
                         await tg(
                             http,
@@ -356,7 +363,7 @@ async def deliver(message: Message) -> list[str]:
                     except Exception:
                         pass
                 continue
-            for chat_id, thread in routes(kind):
+            for chat_id, thread in dest(kind):
                 try:
                     await tg_upload(http, chat_id, filename, blob, thread)
                 except Exception as e:
@@ -414,12 +421,13 @@ async def handle_load(http: httpx.AsyncClient, chat_id: int, count: int) -> None
         return
 
     history = sorted(history, key=lambda m: m.time or 0)[-count:]
-    targets = len(routes("text"))
+    # Выгрузка идёт только сюда, в чат с ботом: группу класса ей засорять незачем.
+    here: list[tuple[int, int | None]] = [(chat_id, None)]
     await tg(
         http,
         "sendMessage",
         chat_id=chat_id,
-        text=f"Загружаю {len(history)} шт., адресатов: {targets}.",
+        text=f"Загружаю {len(history)} шт. сюда, в этот чат.",
     )
 
     sent = failed = empty = 0
@@ -433,7 +441,7 @@ async def handle_load(http: httpx.AsyncClient, chat_id: int, count: int) -> None
         if not old.chat_id:  # в истории поле бывает пустым
             old.chat_id = MAX_CHAT_ID
         try:
-            errs = await deliver(old)
+            errs = await deliver(old, to=here)
             sent += 1
             if errs:
                 failed += len(errs)
@@ -448,8 +456,6 @@ async def handle_load(http: httpx.AsyncClient, chat_id: int, count: int) -> None
         report += f" Пустых и служебных: {empty}."
     if failed:
         report += f" Ошибок: {failed}. Последняя: {last_error}"
-    if not targets:
-        report += " Адресатов ноль: проверьте TG_TARGETS и TG_GROUP."
     await tg(http, "sendMessage", chat_id=chat_id, text=report)
 
 
