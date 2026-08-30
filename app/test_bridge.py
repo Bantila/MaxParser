@@ -76,6 +76,16 @@ def test_format_from_max():
     assert "<b>x</b>" not in format_from_max("Мария", "т", "<b>x</b>")
 
 
+def test_seen_roundtrip(tmp="_seen_test.txt"):
+    import os
+
+    bridge.save_seen({3, 1, 2}, tmp)
+    assert bridge.load_seen(tmp) == {1, 2, 3}
+    os.remove(tmp)
+    # отсутствующий файл не должен ронять запуск
+    assert bridge.load_seen("нет-такого-файла.txt") == set()
+
+
 def test_id_of():
     class Plain:
         id = 42

@@ -92,6 +92,11 @@ TG_TARGETS = parse_ids(os.getenv("TG_TARGETS", ""))
 TG_TRUSTED = parse_ids(os.getenv("TG_TRUSTED", ""))
 READ_ONLY = os.getenv("READ_ONLY", "true").strip().lower() != "false"
 RAW_LOG = (os.getenv("RAW_LOG") or "0").strip() == "1"
+POLL_SECONDS = int(os.getenv("POLL_SECONDS") or 30)
+
+SEEN_PATH = "cache/seen.txt"
+SEEN_KEEP = 500
+seen: set[int] = set()
 
 # Группа и номера тем. Ноль в номере темы означает "в эту тему не слать".
 # TG_TOPICS=1 - раскладывать по темам, 0 - слать в группу одним потоком.
@@ -131,6 +136,31 @@ def user_name(user) -> str:
         if isinstance(n, str) and n:
             return n
     return f"id{getattr(user, 'id', '?')}"
+
+
+def load_seen(path: str = SEEN_PATH) -> set[int]:
+    """Уже отправленные сообщения переживают перезапуск, иначе после него
+    поллинг разослал бы всю историю заново."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            return {int(x) for x in f.read().split()}
+    except Exception:
+        return set()
+
+
+def save_seen(ids: set[int], path: str = SEEN_PATH) -> None:
+    try:
+        recent = sorted(ids)[-SEEN_KEEP:]
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(str(i) for i in recent))
+    except Exception as e:
+        print(f"[poll] не сохранить {path}: {e}", flush=True)
+
+
+def has_content(message: Message) -> bool:
+    """Служебные записи Max пустые: вступил в чат, создана тема, звонок."""
+    src, _, _ = content_of(message)
+    return bool(src.text or src.attaches or message.text or message.attaches)
 
 
 def id_of(obj) -> int | None:
@@ -299,6 +329,10 @@ async def forward_to_telegram(message: Message, client: Client) -> None:
     if me and message.sender == me:
         print("[max] пропуск: собственное сообщение", flush=True)
         return
+    if message.id in seen:
+        return  # уже отправил опрос истории
+    seen.add(message.id)
+    save_seen(seen)
     errors = await deliver(message)
     print(f"[max] доставлено, ошибок: {len(errors)}", flush=True)
 
@@ -533,6 +567,46 @@ async def handle_tg_message(http: httpx.AsyncClient, msg: dict) -> None:
         await tg(http, "sendMessage", chat_id=chat_id, text=f"Не отправилось: {e}")
 
 
+async def poll_history() -> None:
+    """Событий по групповым чатам Max не присылает, поэтому опрашиваем сами.
+
+    Дедупликация по id общая с живым потоком, так что дублей не будет, даже
+    если события внезапно начнут приходить.
+    """
+    while True:
+        await asyncio.sleep(POLL_SECONDS)
+        if not MAX_CHAT_ID or not client.is_connected:
+            continue
+        try:
+            history = await client.fetch_history(MAX_CHAT_ID, backward=20)
+        except Exception as e:
+            print(f"[poll] история не читается: {e}", flush=True)
+            continue
+
+        me = own_id()
+        fresh = 0
+        for old in sorted(history, key=lambda m: m.time or 0):
+            if old.id in seen:
+                continue
+            seen.add(old.id)
+            if me and old.sender == me:
+                continue
+            if not has_content(old):
+                continue
+            if not old.chat_id:
+                old.chat_id = MAX_CHAT_ID
+            try:
+                errors = await deliver(old)
+                fresh += 1
+                if errors:
+                    print(f"[poll] ошибки доставки: {errors[-1]}", flush=True)
+            except Exception as e:
+                print(f"[poll] {old.id} не ушло: {e}", flush=True)
+        if fresh:
+            print(f"[poll] новых сообщений: {fresh}", flush=True)
+            save_seen(seen)
+
+
 async def telegram_loop() -> None:
     offset = None
     async with tg_http() as http:
@@ -588,6 +662,21 @@ async def on_start(client: Client) -> None:
         print("Подписка на чат установлена", flush=True)
     except Exception as e:
         print(f"Не удалось подписаться на чат: {e}", flush=True)
+
+    seen.update(load_seen())
+    if not seen and MAX_CHAT_ID:
+        # Первый запуск: запоминаем историю молча, иначе опрос разошлёт её всю.
+        try:
+            for old in await client.fetch_history(MAX_CHAT_ID, backward=50):
+                seen.add(old.id)
+            save_seen(seen)
+            print(f"Запомнено сообщений: {len(seen)}", flush=True)
+        except Exception as e:
+            print(f"Не удалось запомнить историю: {e}", flush=True)
+
+    if POLL_SECONDS > 0:
+        asyncio.create_task(poll_history())
+        print(f"Опрос истории каждые {POLL_SECONDS} с", flush=True)
     if not MAX_CHAT_ID:
         print("MAX_CHAT_ID пуст: в Telegram польются ВСЕ чаты Max.", flush=True)
     asyncio.create_task(telegram_loop())
